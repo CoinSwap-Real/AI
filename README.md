@@ -1,5 +1,3 @@
-제공해주신 가이드라인 문서를 바탕으로 GitHub 레포지토리에 바로 적용할 수 있는 `README.md` 파일을 작성했습니다.
-
 ---
 
 # SwapGo AI Integration Guide
