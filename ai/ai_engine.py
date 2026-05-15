@@ -1,15 +1,24 @@
 """
 ai/ai_engine.py — ONNX GRU 추론 엔진
 
-입력: SwapGo /chart/ohlc 캔들의 close 가격 시퀀스
-출력: 다음 틱 가격 변화 예측 (EMA 평활)
+[모델 I/O 스펙]
+  입력: (batch=1, seq_len, 8) — FeatureBuilder 가 scaler 적용한 행렬
+  출력: (1, 2)                — [BTC 1초 뒤 로그수익률, ETH 1초 뒤 로그수익률]
 
-가이드 섹션 9 의 팁:
-  - reserve_*, amount_* 는 raw 문자열 → int(x)/10**decimals 로 변환
-  - bucket_start 는 ISO8601 → pd.to_datetime
-  - confidence 0~1 그대로 사용
+[설계 원칙]
+  - 피처 계산·정규화는 FeatureBuilder 에 위임. AIEngine 은 추론만 담당.
+  - EMA 로 출력 평활. BTC / ETH 각각 독립적으로 관리.
+  - Mock 모드: ONNX 파일 없을 때 전 틱 대비 수익률을 그대로 반환.
 
-Mock 모드: ONNX 파일 없을 때 개발/테스트 환경에서도 전체 파이프라인 동작 가능
+[사용 방법]
+  # 폴링 (REST)
+  features = feature_builder.build(btc_candles, eth_candles)  # (N, 8)
+  engine.load_features(features)
+  btc_ret, eth_ret = await engine.infer()   # 로그 수익률
+
+  # 스트리밍 (WebSocket)
+  engine.push_feature_row(row)              # (8,) 행 하나
+  btc_ret, eth_ret = await engine.infer()
 """
 
 from __future__ import annotations
@@ -25,6 +34,10 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+# 모델 출력 인덱스
+_IDX_BTC = 0
+_IDX_ETH = 1
+
 
 class AIEngine:
     def __init__(
@@ -34,105 +47,141 @@ class AIEngine:
         seq_len: int,
     ):
         self.model_name = model_name
-        self.seq_len = seq_len
-        self.input_scale = settings.price_input_scale
-        self.output_scale = settings.pred_output_scale
-        self.ema_alpha = settings.ema_alpha
+        self.seq_len     = seq_len
+        self.ema_alpha   = settings.ema_alpha
 
-        self.buffer: deque = deque(maxlen=seq_len)
-        self._raw_pred: Optional[float] = None
-        self._ema_pred: Optional[float] = None
-        self._infer_count: int = 0
+        # 피처 버퍼: 각 원소는 shape (8,) numpy 배열
+        self._buffer: deque[np.ndarray] = deque(maxlen=seq_len)
 
-        self.session = None
+        # EMA 캐시 (BTC, ETH 각각)
+        self._ema_btc: Optional[float] = None
+        self._ema_eth: Optional[float] = None
+        self._infer_count = 0
+
+        # ONNX 세션
+        self.session    = None
         self.input_name: Optional[str] = None
-        self._mock = False
+        self._mock      = False
         self._init_onnx(model_path)
 
-    # ── 초기화 ───────────────────────────────────────────────
+    # ── ONNX 초기화 ──────────────────────────────────────────
     def _init_onnx(self, path: str) -> None:
         try:
             import onnxruntime as ort
-            self.session = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+            self.session    = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
             self.input_name = self.session.get_inputs()[0].name
-            logger.info(f"[{self.model_name}] ONNX 모델 로드 완료: {path}")
+            # 입력 shape 검증
+            expected = self.session.get_inputs()[0].shape
+            logger.info(
+                f"[{self.model_name}] ONNX 로드 완료: {path}  "
+                f"입력shape={expected}"
+            )
         except Exception as e:
             logger.warning(f"[{self.model_name}] 모델 없음 → Mock 모드: {e}")
             self._mock = True
 
-    # ── 캔들 시퀀스 일괄 입력 (폴링 방식) ────────────────────
-    def load_candles(self, candles: list[dict]) -> None:
-        """
-        REST /chart/ohlc 응답 캔들을 버퍼에 적재합니다.
-        매 ingest 주기 시작 시 최신 N개를 통째로 넣어 버퍼를 갱신합니다.
-        """
-        self.buffer.clear()
-        for c in candles[-self.seq_len :]:
-            close = float(c.get("close", 0))
-            if close > 0:
-                self.buffer.append([close / self.input_scale])
+    # ════════════════════════════════════════════════════════
+    # 버퍼 적재 (폴링 방식)
+    # ════════════════════════════════════════════════════════
 
-    # ── 단일 가격 스트리밍 입력 (WS 방식) ───────────────────
-    def push_price(self, close: float) -> None:
-        """WebSocket 캔들 완성 시 가격 하나를 버퍼에 추가합니다."""
-        if close > 0:
-            self.buffer.append([close / self.input_scale])
+    def load_features(self, features: np.ndarray) -> None:
+        """
+        FeatureBuilder.build() 결과 (N, 8) 배열을 받아 버퍼를 갱신합니다.
+        매 ingest 사이클 시작 시 호출.
+        """
+        if features is None or features.ndim != 2 or features.shape[1] != 8:
+            logger.warning(f"[{self.model_name}] 잘못된 피처 shape: {getattr(features, 'shape', None)}")
+            return
+        self._buffer.clear()
+        for row in features[-self.seq_len:]:
+            self._buffer.append(row.astype(np.float32))
 
-    # ── 비동기 추론 ──────────────────────────────────────────
-    async def infer(self) -> Optional[float]:
+    # ════════════════════════════════════════════════════════
+    # 버퍼 적재 (WebSocket 스트리밍 방식)
+    # ════════════════════════════════════════════════════════
+
+    def push_feature_row(self, row: np.ndarray) -> None:
         """
-        버퍼가 충분히 채워졌을 때 추론 실행.
-        반환값: EMA 평활된 예측 변화율 (양수=상승, 음수=하락)
+        완성된 캔들 1개에서 계산한 피처 벡터 (8,) 를 버퍼에 추가합니다.
+        WS 모드에서 캔들 완성 콜백마다 호출.
         """
-        if len(self.buffer) < self.seq_len:
+        if row is None or row.shape != (8,):
+            return
+        self._buffer.append(row.astype(np.float32))
+
+    # ════════════════════════════════════════════════════════
+    # 추론
+    # ════════════════════════════════════════════════════════
+
+    async def infer(self) -> Optional[tuple[float, float]]:
+        """
+        버퍼가 seq_len 만큼 채워지면 추론 실행.
+
+        반환값:
+          (btc_log_return, eth_log_return) — EMA 평활된 로그 수익률
+          None — 버퍼 미충전
+        """
+        if not self.is_warm:
             return None
 
         if self._mock:
-            prices = [v[0] for v in self.buffer]
-            raw = (prices[-1] - prices[-2]) * self.output_scale
-            self._update_ema(raw)
-            return self._ema_pred
+            return self._mock_predict()
 
-        arr = np.array([list(self.buffer)], dtype=np.float32)
+        arr = np.array([list(self._buffer)], dtype=np.float32)  # (1, seq_len, 8)
         try:
             output = await asyncio.to_thread(
                 self.session.run, None, {self.input_name: arr}
             )
-            raw = float(output[0][0][0])
-            self._raw_pred = raw
-            self._update_ema(raw)
+            # output shape: (1, 2)
+            btc_raw = float(output[0][0][_IDX_BTC])
+            eth_raw = float(output[0][0][_IDX_ETH])
+
+            self._ema_btc = _ema_update(self._ema_btc, btc_raw, self.ema_alpha)
+            self._ema_eth = _ema_update(self._ema_eth, eth_raw, self.ema_alpha)
             self._infer_count += 1
-            return self._ema_pred
+
+            return self._ema_btc, self._ema_eth
+
         except Exception as e:
             logger.error(f"[{self.model_name}] 추론 실패: {e}")
             return None
 
-    # ── EMA 평활 ─────────────────────────────────────────────
-    def _update_ema(self, val: float) -> None:
-        if self._ema_pred is None:
-            self._ema_pred = val
-        else:
-            self._ema_pred = self.ema_alpha * val + (1 - self.ema_alpha) * self._ema_pred
+    def _mock_predict(self) -> tuple[float, float]:
+        """개발 Mock: 버퍼 마지막 두 행의 수익률 그대로 반환"""
+        buf = list(self._buffer)
+        # 피처 idx 0 = Ret_btc, idx 1 = Ret_eth (scaler 이전 값 기준)
+        btc_raw = float(buf[-1][0]) if buf else 0.0
+        eth_raw = float(buf[-1][1]) if buf else 0.0
+        self._ema_btc = _ema_update(self._ema_btc, btc_raw, self.ema_alpha)
+        self._ema_eth = _ema_update(self._ema_eth, eth_raw, self.ema_alpha)
+        return self._ema_btc, self._ema_eth  # type: ignore[return-value]
 
-    # ── 상태 조회 ────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════
+    # 상태 조회
+    # ════════════════════════════════════════════════════════
+
     @property
     def is_warm(self) -> bool:
-        return len(self.buffer) >= self.seq_len
-
-    @property
-    def direction(self) -> Optional[int]:
-        """예측 방향: +1(상승) / -1(하락) / None(워밍업 중)"""
-        if self._ema_pred is None:
-            return None
-        return 1 if self._ema_pred > 0 else -1
+        return len(self._buffer) >= self.seq_len
 
     def get_info(self) -> dict:
         return {
             "model": self.model_name,
             "seq_len": self.seq_len,
-            "buffer_fill": len(self.buffer),
+            "buffer_fill": len(self._buffer),
             "is_warm": self.is_warm,
-            "ema_prediction": self._ema_pred,
+            "ema_btc": self._ema_btc,
+            "ema_eth": self._ema_eth,
             "infer_count": self._infer_count,
             "mock_mode": self._mock,
         }
+
+
+# ════════════════════════════════════════════════════════════
+# 순수 함수
+# ════════════════════════════════════════════════════════════
+
+def _ema_update(prev: Optional[float], new: float, alpha: float) -> float:
+    if prev is None:
+        return new
+    return alpha * new + (1.0 - alpha) * prev
