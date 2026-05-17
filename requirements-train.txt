@@ -1,0 +1,8 @@
+# 학습 전용 의존성 (서버 배포 시 불필요)
+torch>=2.2.0
+onnx>=1.16.0
+onnxruntime>=1.18.0
+numpy>=1.26.0
+pandas>=2.2.0
+scikit-learn>=1.4.0
+joblib>=1.4.0
