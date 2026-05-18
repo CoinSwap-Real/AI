@@ -65,11 +65,12 @@ class BotA_Ingest:
         ai_scalper: AIEngine,   # seq=10  → horizon "1h"
         ai_swing: AIEngine,     # seq=60  → horizon "24h"
         ai_longterm: AIEngine,  # seq=120 → horizon "7d"
+        candle_cache=None,      # CandleCache | None (주입 시 REST 중복 제거)
     ):
         self._client  = client
         self._fb      = feature_builder
+        self._cache   = candle_cache   # None 이면 직접 REST 호출 방식 유지
         self._ingest  = IngestService(client)
-        # (엔진, horizon) 쌍 — 순서 고정
         self._engines: list[tuple[AIEngine, str]] = [
             (ai_scalper,  "1h"),
             (ai_swing,    "24h"),
@@ -96,43 +97,52 @@ class BotA_Ingest:
         self._tick_count += 1
         logger.info(f"[Bot A] 사이클 #{self._tick_count}")
 
-        # 1. BTC 캔들 / ETH 캔들 / ticker 병렬 수집
-        btc_candles, eth_candles, ticker = await asyncio.gather(
-            self._client.get_ohlc(
-                settings.pool_id,
-                interval=settings.candle_interval,
-                limit=settings.candle_limit,
-            ),
-            self._client.get_ohlc(
-                settings.eth_pool_id,
-                interval=settings.candle_interval,
-                limit=settings.candle_limit,
-            ),
-            self._client.get_ticker(settings.pool_id),
-            return_exceptions=True,
-        )
-        if isinstance(btc_candles, Exception):
-            logger.error(f"[Bot A] BTC 캔들 수집 실패: {btc_candles}")
-            return
-        if isinstance(eth_candles, Exception):
-            logger.error(f"[Bot A] ETH 캔들 수집 실패: {eth_candles}")
-            return
-        if isinstance(ticker, Exception):
-            logger.warning(f"[Bot A] ticker 수집 실패, 계속 진행: {ticker}")
-            ticker = {}
-
-        btc_last_price = _safe_float(ticker.get("last_price"))
-
-        # 2. 캔들 → 8피처 행렬 (scaler 적용)
-        features = self._fb.build(btc_candles, eth_candles)
-        if features is None:
-            logger.info("[Bot A] 피처 빌드 실패 (캔들 부족) — skip")
-            return
-
-        # ETH 마지막 캔들에서 현재 ETH 가격 추출
-        eth_last_price = _safe_float(
-            eth_candles[-1].get("close") if eth_candles else None
-        )
+        # 1. 캔들 수집 — CandleCache 주입 시 캐시 경유, 없으면 직접 호출
+        if self._cache is not None:
+            # CandleCache: BTC 갱신 + ETH TTL 자동 갱신
+            await self._cache.refresh_btc_from_rest()
+            ticker_result = await self._client.get_ticker(settings.pool_id)
+            ticker = ticker_result if not isinstance(ticker_result, Exception) else {}
+            features = await self._cache.get_features()
+            if features is None:
+                logger.info("[Bot A] 피처 빌드 실패 (캔들 부족) — skip")
+                return
+            btc_last_price = _safe_float(ticker.get("last_price"))
+            eth_last_price = self._cache.latest_eth_close()
+            btc_candles    = self._cache.btc_candles()
+        else:
+            # Fallback: CandleCache 없이 직접 REST 호출
+            btc_candles, eth_candles, ticker = await asyncio.gather(
+                self._client.get_ohlc(
+                    settings.pool_id,
+                    interval=settings.candle_interval,
+                    limit=settings.candle_limit,
+                ),
+                self._client.get_ohlc(
+                    settings.eth_pool_id,
+                    interval=settings.candle_interval,
+                    limit=settings.candle_limit,
+                ),
+                self._client.get_ticker(settings.pool_id),
+                return_exceptions=True,
+            )
+            if isinstance(btc_candles, Exception):
+                logger.error(f"[Bot A] BTC 캔들 수집 실패: {btc_candles}")
+                return
+            if isinstance(eth_candles, Exception):
+                logger.error(f"[Bot A] ETH 캔들 수집 실패: {eth_candles}")
+                return
+            if isinstance(ticker, Exception):
+                logger.warning(f"[Bot A] ticker 수집 실패, 계속 진행: {ticker}")
+                ticker = {}
+            btc_last_price = _safe_float(ticker.get("last_price"))
+            eth_last_price = _safe_float(
+                eth_candles[-1].get("close") if eth_candles else None
+            )
+            features = self._fb.build(btc_candles, eth_candles)
+            if features is None:
+                logger.info("[Bot A] 피처 빌드 실패 (캔들 부족) — skip")
+                return
 
         # 3. 모든 엔진에 피처 적재
         for engine, _ in self._engines:

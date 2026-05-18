@@ -1,117 +1,198 @@
 """
-services/event_bus.py — 단일 WebSocket → 다중 구독자 팬아웃
+services/candle_cache.py — 공유 캔들 버퍼 + 피처 캐시
 
 [해결하는 문제]
-  BotA_Trade, BotB_WS 가 각자 WsClient 를 생성 → SwapGo 에 WS 연결 2개 유지.
-  CandleEventBus 는 단 1개의 WS 연결을 유지하고, 수신한 캔들을
-  asyncio.Queue 를 통해 모든 구독자에게 분배합니다.
+  - BotA_Trade / BotB_WS 가 ETH 캔들을 각자 독립적으로 REST 호출 → 중복 제거
+  - 캔들마다 FeatureBuilder.build() 를 여러 봇이 각자 호출 → 1회로 통합
+  - BotA_Ingest 의 REST 폴링도 동일 캐시를 읽어 중복 API 호출 방지
 
-[사용 방법]
-  bus = CandleEventBus(pool_id=1)
-  bus.subscribe(my_async_callback)   # async def callback(candle: dict)
-  asyncio.create_task(bus.run())     # WS 수신 루프 (재접속 포함)
-
-[설계 원칙]
-  - 구독자별 Queue 분리: 한 구독자의 처리 지연이 다른 구독자를 차단하지 않음
-  - 큐 포화(maxsize) 시 최신 캔들 유지: 느린 구독자는 오래된 캔들을 건너뜀
-  - 구독자 예외 격리: 한 구독자 오류가 WS 연결에 영향 없음
+[캐시 전략]
+  - BTC 캔들: WS 푸시(실시간) 또는 REST 갱신(폴링) 양쪽 모두 지원
+  - ETH 캔들: TTL 기반 갱신 (기본 60초). 여러 봇이 동시에 만료 감지해도
+    asyncio.Lock 으로 REST 호출은 단 1회만 발생
+  - 피처 행렬: 캔들 업데이트마다 1회 계산 후 캐시. 동일 캔들 상태이면 재사용
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import traceback
-from typing import Callable
+from collections import deque
+from typing import Optional
+
+import numpy as np
 
 from config import settings
-from core.ws_client import WsClient
+from ai.feature_builder import FeatureBuilder
 
 logger = logging.getLogger(__name__)
 
-_QUEUE_SIZE = 8   # 구독자당 최대 미처리 캔들 수
+_ETH_TTL_SEC = 60.0          # ETH 캔들 REST 갱신 주기
+_FEATURE_STALE_SEC = 5.0     # 피처 캐시 유효 시간 (동일 캔들 내 재요청 방지)
 
 
-class CandleEventBus:
+class CandleCache:
     """
-    단일 WS 연결을 공유하는 캔들 이벤트 버스.
-    구독자는 각자 asyncio.Queue 를 통해 독립적으로 캔들을 수신합니다.
+    모든 봇이 공유하는 캔들 버퍼 + 피처 캐시 싱글턴.
+    생성 후 main.py 에서 app.state.candle_cache 에 보관하고
+    각 봇이 주입받아 사용합니다.
     """
 
-    def __init__(self, pool_id: int | None = None):
-        self._ws = WsClient(pool_id=pool_id or settings.pool_id)
-        self._ws.on_candle(self._on_candle)
+    def __init__(self, client, feature_builder: FeatureBuilder):
+        self._client = client
+        self._fb     = feature_builder
 
-        # 구독자별 Queue (dict key = 구독 ID)
-        self._queues: dict[int, asyncio.Queue] = {}
-        self._next_id = 0
-        self._candle_count = 0
+        self._btc: deque[dict] = deque(maxlen=settings.candle_limit)
+        self._eth: list[dict]  = []
 
-    # ── 구독 등록 ────────────────────────────────────────────
-    def subscribe(self, callback: Callable) -> None:
-        """
-        캔들 완성 이벤트를 수신할 async 콜백 함수를 등록합니다.
-        콜백은 별도 Task 에서 실행되므로 느려도 버스를 차단하지 않습니다.
-        """
-        sub_id = self._next_id
-        self._next_id += 1
-        queue: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_SIZE)
-        self._queues[sub_id] = queue
+        self._eth_ts:      float = 0.0   # 마지막 ETH 갱신 시각
+        self._eth_lock     = asyncio.Lock()
 
-        # 각 구독자마다 독립 소비 태스크 생성
-        asyncio.create_task(
-            self._consumer(sub_id, queue, callback),
-            name=f"event_bus_consumer_{sub_id}",
-        )
-        logger.debug(
-            f"[EventBus] 구독 등록 #{sub_id}: "
-            f"{getattr(callback, '__qualname__', repr(callback))}"
-        )
+        # 피처 캐시
+        self._features:    Optional[np.ndarray] = None
+        self._features_ts: float = 0.0
+        self._feature_lock = asyncio.Lock()
 
-    # ── WS 수신 루프 ─────────────────────────────────────────
-    async def run(self) -> None:
-        """WS 재접속 루프. main.py 에서 asyncio.create_task 로 실행."""
-        logger.info("[EventBus] WS 수신 루프 시작")
-        await self._ws.run()
+    # ════════════════════════════════════════════════════════
+    # BTC 캔들 업데이트
+    # ════════════════════════════════════════════════════════
 
-    # ── 내부: 캔들 수신 → 큐 분배 ───────────────────────────
-    async def _on_candle(self, candle: dict) -> None:
-        self._candle_count += 1
-        for sub_id, queue in self._queues.items():
-            if queue.full():
-                # 포화 시 가장 오래된 캔들을 버리고 최신 캔들을 넣음
-                try:
-                    queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-                logger.debug(f"[EventBus] 구독자 #{sub_id} 큐 포화 → 오래된 캔들 드롭")
-            await queue.put(candle)
+    def push_btc(self, candle: dict) -> None:
+        """WS 모드: CandleEventBus 가 캔들 완성 시마다 호출."""
+        if float(candle.get("close", 0)) > 0:
+            self._btc.append(candle)
+            self._features_ts = 0.0  # 피처 캐시 무효화
 
-    # ── 내부: 구독자 소비 루프 ───────────────────────────────
-    async def _consumer(
-        self,
-        sub_id: int,
-        queue: asyncio.Queue,
-        callback: Callable,
-    ) -> None:
-        while True:
+    async def refresh_btc_from_rest(self) -> None:
+        """REST 폴링 모드: BotA_Ingest 의 60초 사이클 시 호출."""
+        try:
+            candles = await self._client.get_ohlc(
+                settings.pool_id,
+                interval=settings.candle_interval,
+                limit=settings.candle_limit,
+            )
+            self._btc.clear()
+            for c in candles:
+                if float(c.get("close", 0)) > 0:
+                    self._btc.append(c)
+            self._features_ts = 0.0
+            logger.debug(f"[CandleCache] BTC REST 갱신: {len(self._btc)}개")
+        except Exception:
+            logger.error(f"[CandleCache] BTC REST 갱신 실패\n{traceback.format_exc()}")
+
+    # ════════════════════════════════════════════════════════
+    # ETH 캔들 — TTL 기반 자동 갱신
+    # ════════════════════════════════════════════════════════
+
+    async def _ensure_eth(self) -> None:
+        """ETH 캔들이 TTL 초과 시 REST 갱신. Lock 으로 중복 호출 방지."""
+        if time.monotonic() - self._eth_ts < _ETH_TTL_SEC:
+            return
+        async with self._eth_lock:
+            # double-check: 다른 코루틴이 Lock 보유 중 이미 갱신했을 수 있음
+            if time.monotonic() - self._eth_ts < _ETH_TTL_SEC:
+                return
             try:
-                candle = await queue.get()
-                await callback(candle)
-                queue.task_done()
-            except Exception:
-                name = getattr(callback, "__qualname__", repr(callback))
-                logger.error(
-                    f"[EventBus] 구독자 #{sub_id} ({name}) 오류\n"
-                    f"{traceback.format_exc()}"
+                self._eth = await self._client.get_ohlc(
+                    settings.eth_pool_id,
+                    interval=settings.candle_interval,
+                    limit=settings.candle_limit,
                 )
+                self._eth_ts = time.monotonic()
+                self._features_ts = 0.0
+                logger.debug(f"[CandleCache] ETH 갱신: {len(self._eth)}개")
+            except Exception:
+                logger.warning(f"[CandleCache] ETH 갱신 실패\n{traceback.format_exc()}")
 
-    # ── 상태 ─────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════
+    # 피처 행렬 — 캔들 변경 시 1회 계산 후 캐시
+    # ════════════════════════════════════════════════════════
+
+    async def get_features(self) -> Optional[np.ndarray]:
+        """
+        (N, 8) scaler 적용 피처 행렬 반환.
+        최근 캔들 업데이트 이후 최초 1회만 계산하고 이후 캐시 반환.
+        """
+        await self._ensure_eth()
+
+        now = time.monotonic()
+        if self._features is not None and now - self._features_ts < _FEATURE_STALE_SEC:
+            return self._features
+
+        async with self._feature_lock:
+            # double-check
+            if self._features is not None and time.monotonic() - self._features_ts < _FEATURE_STALE_SEC:
+                return self._features
+
+            btc_list = list(self._btc)
+            eth_list = self._eth
+
+            if len(btc_list) < 2 or len(eth_list) < 2:
+                return None
+
+            try:
+                features = await asyncio.to_thread(
+                    self._fb.build, btc_list, eth_list
+                )
+                self._features    = features
+                self._features_ts = time.monotonic()
+                return features
+            except Exception:
+                logger.error(f"[CandleCache] 피처 빌드 실패\n{traceback.format_exc()}")
+                return None
+
+    # ════════════════════════════════════════════════════════
+    # 편의 메서드
+    # ════════════════════════════════════════════════════════
+
+    def latest_btc_close(self) -> float:
+        return float(self._btc[-1].get("close", 0)) if self._btc else 0.0
+
+    def latest_eth_close(self) -> float:
+        return float(self._eth[-1].get("close", 0)) if self._eth else 0.0
+
+    def btc_candles(self) -> list[dict]:
+        return list(self._btc)
+
     def get_info(self) -> dict:
         return {
-            "subscriber_count": len(self._queues),
-            "candle_count":     self._candle_count,
-            "queue_sizes":      {
-                str(sid): q.qsize() for sid, q in self._queues.items()
-            },
+            "btc_count":      len(self._btc),
+            "eth_count":      len(self._eth),
+            "eth_age_sec":    round(time.monotonic() - self._eth_ts, 1),
+            "features_shape": list(self._features.shape) if self._features is not None else None,
+            "features_age_sec": round(time.monotonic() - self._features_ts, 1),
         }
+
+    # ════════════════════════════════════════════════════════
+    # 초기 프리페치 (시스템 시작 시)
+    # ════════════════════════════════════════════════════════
+
+    async def prefetch(self) -> None:
+        """시스템 시작 시 한 번 호출. BTC + ETH 캔들을 동시에 수집합니다."""
+        try:
+            btc, eth = await asyncio.gather(
+                self._client.get_ohlc(
+                    settings.pool_id,
+                    interval=settings.candle_interval,
+                    limit=settings.candle_limit,
+                ),
+                self._client.get_ohlc(
+                    settings.eth_pool_id,
+                    interval=settings.candle_interval,
+                    limit=settings.candle_limit,
+                ),
+            )
+            self._btc.clear()
+            for c in btc:
+                if float(c.get("close", 0)) > 0:
+                    self._btc.append(c)
+            self._eth    = eth
+            self._eth_ts = time.monotonic()
+            logger.info(
+                f"[CandleCache] 프리페치 완료 "
+                f"BTC={len(self._btc)} ETH={len(self._eth)}"
+            )
+        except Exception:
+            logger.error(f"[CandleCache] 프리페치 실패\n{traceback.format_exc()}")

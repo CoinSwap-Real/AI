@@ -1,157 +1,144 @@
 """
-bots/bot_b_ws.py — WebSocket 실시간 캔들 수신 봇
+bots/bot_b_ws.py — 시스템 A 보조: WebSocket 실시간 ingest 봇
 
-use_websocket=True 설정 시 활성화됩니다.
+[경량화 적용 사항]
+  이전 구조                        →  개선 구조
+  ──────────────────────────────────────────────────────────
+  자체 WsClient 생성 + run()        →  CandleEventBus.subscribe(on_candle) 으로 대체
+  자체 _btc_window deque            →  CandleCache.btc_candles() 읽기
+  자체 ETH_REFRESH_EVERY REST 호출  →  CandleCache.get_features() 에 ETH TTL 위임
+  자체 _prefetch() REST 2회         →  CandleCache.prefetch() 공유
+  피처 캔들마다 직접 계산           →  CandleCache.get_features() 캐시 재사용
 
-[동작 방식]
-  1. BTC 풀의 ohlc:{pool_id}:1m 채널 구독
-  2. 캔들 완성 이벤트마다:
-     a. BTC 캔들 슬라이딩 윈도우 갱신
-     b. ETH 캔들 REST 갱신 (N 캔들마다 1회, 캐시 사용)
-     c. FeatureBuilder.build() → (N, 8) 피처 행렬
-     d. 각 엔진에 push_feature_row() (마지막 행만)
-     e. infer() → (btc_ret, eth_ret)
-     f. ingest 업로드
+[역할]
+  캔들 완성 이벤트마다 3개 ingest 엔진(scalper/swing/longterm) 을 추론하고
+  signals / predictions / sentiment 를 SwapGo ingest API 에 즉시 업로드합니다.
 
-[ETH 캔들 갱신 전략]
-  - ETH 풀도 WS 를 동시에 구독하면 이상적이지만 구현 복잡도↑
-  - 현실적 타협: BTC 캔들 ETH_REFRESH_EVERY 개마다 REST 1회 호출
-  - 기본값 10 → 1m 캔들 기준 약 10분마다 ETH 갱신
+[EventBus 구독 방법]  main.py 에서:
+  event_bus.subscribe(bot_b_ws.on_candle)
+
+[run() 동작]
+  WS 모드에서 CandleEventBus 가 on_candle 을 직접 호출하므로
+  run() 은 태스크 생존용 무한 대기만 수행합니다.
+  WS 비활성 시 이 봇 자체가 main.py 에서 생성되지 않습니다.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import traceback
-from collections import deque
 from typing import Optional
 
 from config import settings
 from core.swapgo_client import SwapGoClient
-from core.ws_client import WsClient
-from ai.feature_builder import FeatureBuilder
 from ai.ai_engine import AIEngine
+from services.candle_cache import CandleCache
 from services.ingest_service import IngestService
-from schemas.models import AIInferenceResult, HorizonPrediction, CandleData
+from schemas.models import AIInferenceResult, HorizonPrediction
 from bots.bot_a_ingest import (
-    _ret_to_signal, _ret_to_confidence, _ret_to_sentiment,
-    _calc_rsi, _calc_macd, _calc_ma, _safe_float,
-    _CI_HALF, _CONF_DECAY, _BTC_SYMBOL, _ETH_SYMBOL,
+    _ret_to_signal,
+    _ret_to_confidence,
+    _ret_to_sentiment,
+    _calc_rsi,
+    _calc_macd,
+    _calc_ma,
+    _CI_HALF,
+    _CONF_DECAY,
+    _BTC_SYMBOL,
+    _ETH_SYMBOL,
 )
-import math
 
 logger = logging.getLogger(__name__)
 
-ETH_REFRESH_EVERY = 10  # BTC 캔들 N개마다 ETH 캔들 REST 갱신
-
 
 class BotB_WS:
+    """
+    WebSocket 실시간 ingest 봇.
+    캔들 완성 이벤트마다 ingest API 에 신호·예측·심리를 업로드합니다.
+    캔들 버퍼·피처 계산은 모두 CandleCache 에 위임합니다.
+    """
+
     def __init__(
         self,
         client: SwapGoClient,
-        feature_builder: FeatureBuilder,
         ai_scalper: AIEngine,
         ai_swing: AIEngine,
         ai_longterm: AIEngine,
+        candle_cache: CandleCache,
     ):
         self._client  = client
-        self._fb      = feature_builder
         self._ingest  = IngestService(client)
+        self._cache   = candle_cache
         self._engines: list[tuple[AIEngine, str]] = [
             (ai_scalper,  "1h"),
             (ai_swing,    "24h"),
             (ai_longterm, "7d"),
         ]
-
-        # 슬라이딩 캔들 윈도우
-        max_seq = max(e.seq_len for e, _ in self._engines)
-        self._btc_window: deque[dict] = deque(maxlen=settings.candle_limit)
-        self._eth_cache:  list[dict]  = []
         self._candle_count = 0
 
-        # WS 클라이언트
-        self._ws = WsClient(pool_id=settings.pool_id)
-        self._ws.on_candle(self._on_btc_candle)
+    # ════════════════════════════════════════════════════════
+    # 진입점 — 태스크 생존용 루프 (실제 처리는 on_candle 콜백)
+    # ════════════════════════════════════════════════════════
 
     async def run(self) -> None:
-        logger.info("[Bot B WS] 시작")
-        # 초기 캔들 REST 프리페치
-        await self._prefetch()
-        await self._ws.run()
+        logger.info("[BotB_WS] 시작 (EventBus 구독 대기 중)")
+        while True:
+            await asyncio.sleep(3600)
 
-    # ── 초기 프리페치 ────────────────────────────────────────
-    async def _prefetch(self) -> None:
-        try:
-            btc, eth = await asyncio.gather(
-                self._client.get_ohlc(
-                    settings.pool_id,
-                    interval=settings.candle_interval,
-                    limit=settings.candle_limit,
-                ),
-                self._client.get_ohlc(
-                    settings.eth_pool_id,
-                    interval=settings.candle_interval,
-                    limit=settings.candle_limit,
-                ),
-            )
-            for c in btc:
-                self._btc_window.append(c)
-            self._eth_cache = eth
-            logger.info(
-                f"[Bot B WS] 프리페치 완료 "
-                f"BTC={len(self._btc_window)} ETH={len(self._eth_cache)}"
-            )
-        except Exception as e:
-            logger.warning(f"[Bot B WS] 프리페치 실패: {e}")
+    # ════════════════════════════════════════════════════════
+    # CandleEventBus 구독 콜백 (public)
+    # main.py: event_bus.subscribe(bot_b_ws.on_candle)
+    # ════════════════════════════════════════════════════════
 
-    # ── BTC 캔들 완성 콜백 ───────────────────────────────────
-    async def _on_btc_candle(self, candle: dict) -> None:
+    async def on_candle(self, candle: dict) -> None:
+        """
+        CandleEventBus 가 캔들 완성 시마다 호출합니다.
+
+        순서:
+          1. CandleCache 에서 공유 피처 행렬 획득 (캐시 히트 시 O(1))
+          2. 마지막 행을 각 엔진 버퍼에 push
+          3. 병렬 추론
+          4. AIInferenceResult 조립 후 ingest 업로드
+        """
         try:
-            if _safe_float(candle.get("close")) <= 0:
+            close_btc = float(candle.get("close", 0))
+            if close_btc <= 0:
                 return
-
-            self._btc_window.append(candle)
             self._candle_count += 1
 
-            # ETH 캔들 갱신 (주기적으로)
-            if self._candle_count % ETH_REFRESH_EVERY == 1 or not self._eth_cache:
-                await self._refresh_eth()
-
-            if not self._eth_cache:
-                return
-
-            # 피처 빌드
-            features = self._fb.build(
-                list(self._btc_window),
-                self._eth_cache,
-            )
+            # 1. CandleCache 에서 피처 획득
+            #    cache.push_btc(candle) 은 EventBus 가 먼저 호출하므로 여기선 읽기만
+            features = await self._cache.get_features()
             if features is None:
                 return
 
-            # 마지막 피처 행을 각 엔진에 push
+            # 2. 마지막 피처 행 → 각 엔진 push
             last_row = features[-1]
             for engine, _ in self._engines:
                 engine.push_feature_row(last_row)
 
-            # 병렬 추론
+            # 3. 병렬 추론
             raw_preds = await asyncio.gather(
                 *[engine.infer() for engine, _ in self._engines]
             )
             if all(p is None for p in raw_preds):
                 return
 
-            btc_last = _safe_float(candle.get("close"))
-            eth_last = _safe_float(
-                self._eth_cache[-1].get("close") if self._eth_cache else None
-            )
+            # 4. BTC / ETH 결과 조립 후 ingest 업로드
+            btc_last = close_btc
+            eth_last = self._cache.latest_eth_close()
+            btc_list = self._cache.btc_candles()
 
             results = []
             for symbol, ret_idx, last_price in [
                 (_BTC_SYMBOL, 0, btc_last),
                 (_ETH_SYMBOL, 1, eth_last),
             ]:
-                result = self._build_result(symbol, raw_preds, ret_idx, last_price)
+                result = self._build_result(
+                    symbol, raw_preds, ret_idx, last_price, btc_list
+                )
                 if result:
                     results.append(result)
 
@@ -159,26 +146,19 @@ class BotB_WS:
                 await self._ingest.upload_all(results)
 
         except Exception:
-            logger.error(f"[Bot B WS] 캔들 처리 오류\n{traceback.format_exc()}")
+            logger.error(f"[BotB_WS] on_candle 오류\n{traceback.format_exc()}")
 
-    # ── ETH 갱신 ─────────────────────────────────────────────
-    async def _refresh_eth(self) -> None:
-        try:
-            self._eth_cache = await self._client.get_ohlc(
-                settings.eth_pool_id,
-                interval=settings.candle_interval,
-                limit=settings.candle_limit,
-            )
-        except Exception as e:
-            logger.warning(f"[Bot B WS] ETH 캔들 갱신 실패: {e}")
+    # ════════════════════════════════════════════════════════
+    # AIInferenceResult 조립
+    # ════════════════════════════════════════════════════════
 
-    # ── AIInferenceResult 조립 (bot_a 와 동일 로직) ──────────
     def _build_result(
         self,
         symbol: str,
         raw_preds: list,
         ret_idx: int,
         last_price: float,
+        btc_list: list[dict],
     ) -> Optional[AIInferenceResult]:
         horizon_preds: list[HorizonPrediction] = []
         valid_rets: list[float] = []
@@ -192,12 +172,18 @@ class BotB_WS:
                 valid_rets.append(log_ret)
 
             pred_price = (last_price * math.exp(log_ret)) if last_price > 0 else 0.0
-            ci = _CI_HALF[horizon]
+            ci         = _CI_HALF[horizon]
             horizon_preds.append(HorizonPrediction(
                 horizon=horizon,
-                predicted_price_human=f"{pred_price:.4f}" if pred_price > 0 else "0.0000",
-                lower_bound_human=f"{pred_price*(1-ci):.4f}" if pred_price > 0 else None,
-                upper_bound_human=f"{pred_price*(1+ci):.4f}" if pred_price > 0 else None,
+                predicted_price_human=(
+                    f"{pred_price:.4f}" if pred_price > 0 else "0.0000"
+                ),
+                lower_bound_human=(
+                    f"{pred_price * (1 - ci):.4f}" if pred_price > 0 else None
+                ),
+                upper_bound_human=(
+                    f"{pred_price * (1 + ci):.4f}" if pred_price > 0 else None
+                ),
                 confidence=round(conf * _CONF_DECAY[horizon], 4),
             ))
 
@@ -206,7 +192,6 @@ class BotB_WS:
 
         ens_ret        = sum(valid_rets) / len(valid_rets)
         side, ens_conf = _ret_to_signal(ens_ret)
-        btc_list       = list(self._btc_window)
 
         return AIInferenceResult(
             symbol=symbol,
@@ -221,10 +206,16 @@ class BotB_WS:
             model_tag=settings.model_tag,
         )
 
+    # ════════════════════════════════════════════════════════
+    # 상태 조회
+    # ════════════════════════════════════════════════════════
+
     def get_stats(self) -> dict:
         return {
             "candle_count": self._candle_count,
-            "btc_window": len(self._btc_window),
-            "eth_cache":  len(self._eth_cache),
-            "engines": [{"horizon": h, **e.get_info()} for e, h in self._engines],
+            "cache_info":   self._cache.get_info(),
+            "engines": [
+                {"horizon": h, **engine.get_info()}
+                for engine, h in self._engines
+            ],
         }
