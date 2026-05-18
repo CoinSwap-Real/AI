@@ -101,8 +101,8 @@ async def lifespan(app: FastAPI):
         event_bus.subscribe(cache.push_btc)
 
         # WS 기반 ingest 봇
-        bot_b_ws = BotB_WS(client, fb, ai_scalper, ai_swing, ai_longterm,
-                           candle_cache=cache, event_bus=event_bus)
+        bot_b_ws = BotB_WS(client, ai_scalper, ai_swing, ai_longterm,
+                           candle_cache=cache)
         event_bus.subscribe(bot_b_ws.on_candle)
 
         tasks.append(asyncio.create_task(event_bus.run(), name="event_bus"))
@@ -113,7 +113,7 @@ async def lifespan(app: FastAPI):
 
     if settings.enable_trade_bots:
         ai_trade = AIEngine("Trade", settings.model_trade_path, seq_len=30)
-        bot_a_trade = BotA_Trade(client, fb, ai_trade,
+        bot_a_trade = BotA_Trade(client, ai_trade,
                                  candle_cache=cache,
                                  trade_event_publisher=publish_trade_event)
         bot_b_noise = BotB_Noise(client,
