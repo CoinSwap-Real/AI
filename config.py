@@ -22,13 +22,19 @@ class Settings(BaseSettings):
     symbols: list[str] = Field(["BTC", "ETH"])
 
     # ── AI 모델 경로 ─────────────────────────────────────────
-    # [ingest 봇 전용: 장기 예측]
-    model_scalper_path: str = Field("models/model_scalper.onnx",   description="1h 신호용 (seq=10)")
-    model_swing_path: str = Field("models/model_swing.onnx",       description="24h 신호용 (seq=60)")
-    model_longterm_path: str = Field("models/model_longterm.onnx", description="7d 신호용 (seq=120)")
-    # [거래 봇 전용: 단기 예측]
-    model_trade_path: str = Field("models/model_trade.onnx",       description="실시간 거래용 (seq=30, 1분 타깃)")
+    # 4개 모델 모두 5m 캔들 Binance 데이터로 학습합니다.
+    # 봇 런타임도 CANDLE_INTERVAL=5m 을 사용합니다.
+    model_scalper_path:  str = Field("models/model_scalper.onnx",  description="1h  신호용 seq_len=10")
+    model_swing_path:    str = Field("models/model_swing.onnx",    description="24h 신호용 seq_len=60")
+    model_longterm_path: str = Field("models/model_longterm.onnx", description="7d  신호용 seq_len=120")
+    model_trade_path:    str = Field("models/model_trade.onnx",    description="거래봇용  seq_len=30")
     model_tag: str = Field("gru-v1")
+
+    # ── AI 엔진 seq_len ──────────────────────────────────────
+    seq_len_scalper:  int = Field(10,  ge=1)
+    seq_len_swing:    int = Field(60,  ge=1)
+    seq_len_longterm: int = Field(120, ge=1)
+    seq_len_trade:    int = Field(30,  ge=1)
 
     # ── Scaler ──────────────────────────────────────────────
     scaler_path: str = Field("models/scaler.pkl", description="4개 모델 공통 8피처 scaler")
@@ -37,7 +43,7 @@ class Settings(BaseSettings):
     ema_alpha: float = Field(0.3)
 
     # ── 캔들 수집 ────────────────────────────────────────────
-    candle_interval: Literal["1m", "5m", "1h", "1d"] = Field("1m")
+    candle_interval: Literal["1m", "5m", "1h", "1d"] = Field("5m", description="학습 데이터와 동일한 5m 캔들")
     candle_limit: int = Field(200, ge=30, le=1000)
 
     # ── ingest 봇 주기 (시스템 A) ────────────────────────────

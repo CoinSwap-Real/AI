@@ -31,14 +31,14 @@ from train_helpers import GRUModel   # 아래 helpers 파일에서 임포트
 
 # ── CLI ───────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument("--horizon", choices=["trade", "1h", "24h", "7d"], required=True)
+parser.add_argument("--horizon", choices=["trade","scalper","swing","longterm"], required=True)
 args = parser.parse_args()
 
 HORIZON_CFG = {
-    "trade": {"seq_len": 30,  "model_name": "model_trade"},
-    "1h":  {"seq_len": 10,  "model_name": "model_scalper"},
-    "24h": {"seq_len": 60,  "model_name": "model_swing"},
-    "7d":  {"seq_len": 120, "model_name": "model_longterm"},
+    "trade":    {"seq_len": 30,  "model_name": "model_trade",    "data_tag": "trade"},
+    "scalper":  {"seq_len": 10,  "model_name": "model_scalper",  "data_tag": "scalper"},
+    "swing":    {"seq_len": 60,  "model_name": "model_swing",    "data_tag": "swing"},
+    "longterm": {"seq_len": 120, "model_name": "model_longterm", "data_tag": "longterm"},
 }
 cfg     = HORIZON_CFG[args.horizon]
 SEQ_LEN = cfg["seq_len"]
@@ -46,7 +46,7 @@ NAME    = cfg["model_name"]
 
 PT_PATH   = f"models/{NAME}_best.pt"
 ONNX_PATH = f"models/{NAME}.onnx"
-DATA_DIR  = Path(f"data/{args.horizon}")
+DATA_DIR  = Path(f"data/{cfg['data_tag']}")
 
 print(f"[{NAME}] ONNX 변환 시작")
 print(f"  PyTorch 소스: {PT_PATH}")

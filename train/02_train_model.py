@@ -23,6 +23,8 @@ import math
 from pathlib import Path
 
 import joblib
+# 학습 시: models/scaler_{model_name}.pkl 사용 (01_build_dataset.py 생성)
+# 봇 런타임: models/scaler.pkl (trade 기준, 5m 분포)
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,20 +32,20 @@ from torch.utils.data import DataLoader, TensorDataset
 
 # ── CLI ───────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument("--horizon", choices=["trade", "1h", "24h", "7d"], required=True)
+parser.add_argument("--horizon", choices=["trade","scalper","swing","longterm"], required=True)
 args = parser.parse_args()
 
 # ── horizon → seq_len / 모델 이름 매핑 ───────────────────────
 HORIZON_CFG = {
-    "trade": {"seq_len": 30,  "model_name": "model_trade"},
-    "1h":  {"seq_len": 10,  "model_name": "model_scalper"},
-    "24h": {"seq_len": 60,  "model_name": "model_swing"},
-    "7d":  {"seq_len": 120, "model_name": "model_longterm"},
+    "trade":    {"seq_len": 30,  "model_name": "model_trade",    "data_tag": "trade"},
+    "scalper":  {"seq_len": 10,  "model_name": "model_scalper",  "data_tag": "scalper"},
+    "swing":    {"seq_len": 60,  "model_name": "model_swing",    "data_tag": "swing"},
+    "longterm": {"seq_len": 120, "model_name": "model_longterm", "data_tag": "longterm"},
 }
 cfg     = HORIZON_CFG[args.horizon]
 SEQ_LEN = cfg["seq_len"]
 NAME    = cfg["model_name"]
-DATA_DIR = Path(f"data/{args.horizon}")
+DATA_DIR = Path(f"data/{cfg['data_tag']}")
 
 # ── 하이퍼파라미터 ────────────────────────────────────────────
 HIDDEN_SIZE  = 64
