@@ -18,6 +18,7 @@ import asyncio
 import logging
 import random
 import traceback
+from typing import Callable, Optional
 
 from config import settings
 from core.swapgo_client import SwapGoClient, StaleQuoteError
@@ -31,10 +32,15 @@ class BotB_Noise:
     설정된 간격으로 무작위 매수/매도를 반복해 풀에 거래량을 공급합니다.
     """
 
-    def __init__(self, client: SwapGoClient):
-        self._client      = client
+    def __init__(
+        self,
+        client: SwapGoClient,
+        trade_event_publisher: Optional[Callable[[dict], None]] = None,
+    ):
+        self._client = client
         self._trade_count = 0
-        self._skip_count  = 0
+        self._skip_count = 0
+        self._publish = trade_event_publisher
 
     # ── 메인 루프 ────────────────────────────────────────────
     async def run(self) -> None:
@@ -60,39 +66,45 @@ class BotB_Noise:
     async def _execute_random_swap(self) -> None:
         amount_min = float(settings.noise_amount_min)
         amount_max = float(settings.noise_amount_max)
-        amount     = round(random.uniform(amount_min, amount_max), 6)
-        is_buy     = random.choice([True, False])
-        swap_side  = "quote_to_base" if is_buy else "base_to_quote"
-        direction  = "BUY " if is_buy else "SELL"
+        amount = round(random.uniform(amount_min, amount_max), 6)
+        is_buy = random.choice([True, False])
+        swap_side = "quote_to_base" if is_buy else "base_to_quote"
+        direction = "BUY " if is_buy else "SELL"
 
         quote_body = {
-            "pool_id":                settings.pool_id,
-            "side":                   swap_side,
-            "amount_in_human":        str(amount),
+            "pool_id": settings.pool_id,
+            "side": swap_side,
+            "amount_in_human": str(amount),
             "slippage_tolerance_bps": settings.noise_slippage_bps,
         }
 
         try:
             # 견적
-            quote          = await self._client.quote_swap(quote_body)
+            raw_quote = await self._client.quote_swap(quote_body)
+
+            # 🌟 [추가된 부분] 백엔드 응답 봉투에서 알맹이("data")만 쏙 빼냅니다.
+            quote = raw_quote.get("data", raw_quote)
+
             slippage_level = quote.get("slippage_level", "safe")
 
             if slippage_level == "danger":
                 self._skip_count += 1
-                logger.debug(f"[BotB_Noise] slippage=danger → 건너뜀 (총 {self._skip_count}회)")
+                logger.debug(
+                    f"[BotB_Noise] slippage=danger → 건너뜀 (총 {self._skip_count}회)"
+                )
                 return
 
             # 실행
             exec_body = {
-                "pool_id":                settings.pool_id,
-                "side":                   swap_side,
-                "amount_in_human":        str(amount),
-                "min_amount_out":         quote["amount_out_min"],
+                "pool_id": settings.pool_id,
+                "side": swap_side,
+                "amount_in_human": str(amount),
+                "min_amount_out": quote["amount_out_min"],
                 "slippage_tolerance_bps": quote.get(
                     "slippage_threshold_used_bps",
                     settings.noise_slippage_bps,
                 ),
-                "expected_revision":      quote["pool_after"]["revision"],
+                "expected_revision": quote["pool_after"]["revision"],
             }
             result = await self._client.execute_swap(exec_body)
             self._trade_count += 1
@@ -115,5 +127,5 @@ class BotB_Noise:
     def get_stats(self) -> dict:
         return {
             "trade_count": self._trade_count,
-            "skip_count":  self._skip_count,
+            "skip_count": self._skip_count,
         }

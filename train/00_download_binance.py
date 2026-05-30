@@ -134,15 +134,26 @@ for symbol in SYMBOLS:
             "trades_count": merged["trades_count"].astype(int),
         }
     )
+
+    # 🚀 (수정된 핵심 코드) 단위 강제 통일 (us -> ms)
+    # 3조(대략 2065년)보다 큰 값이면 마이크로초(us)로 간주하고 1000으로 나누어 밀리초(ms)로 맞춥니다.
+    out.loc[out["timestamp"] > 3000000000000, "timestamp"] = out["timestamp"] // 1000
+
     out = (
         out.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
     )
 
     path = OUT_DIR / f"{symbol}_{INTERVAL}.csv"
     out.to_csv(path, index=False)
-    # 1000으로 나누어 명시적으로 초(s) 단위로 변경하여 Pandas의 내부 계산 오류를 차단합니다.
-    start_dt = pd.to_datetime(out["timestamp"].iloc[0] / 1000.0, unit="s")
-    end_dt = pd.to_datetime(out["timestamp"].iloc[-1] / 1000.0, unit="s")
+
+    # 1. NumPy 타입을 순수 파이썬 float 타입으로 강제 변환 후 1000으로 나누어 초 단위로 변경
+    start_ts = float(out["timestamp"].iloc[0]) / 1000.0
+    end_ts = float(out["timestamp"].iloc[-1]) / 1000.0
+
+    # 2. Pandas를 우회하여 파이썬 내장 datetime 함수로 직접 변환
+    start_dt = datetime.fromtimestamp(start_ts)
+    end_dt = datetime.fromtimestamp(end_ts)
+
     print(f"  저장: {path}  ({len(out):,}행, {start_dt:%Y-%m-%d} ~ {end_dt:%Y-%m-%d})")
 
 print("\n✅ 다운로드 완료!")
