@@ -29,33 +29,41 @@ import pandas as pd
 import requests
 
 # ── 설정 ─────────────────────────────────────────────────────
-SYMBOLS   = ["BTCUSDT", "ETHUSDT"]
-INTERVAL  = "5m"
-BASE_URL  = "https://data.binance.vision/data/spot/monthly/klines"
-OUT_DIR   = Path("data/raw")
-RETRY     = 3
+SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+INTERVAL = "5m"
+BASE_URL = "https://data.binance.vision/data/spot/monthly/klines"
+OUT_DIR = Path("data/raw")
+RETRY = 3
 RETRY_SEC = 5.0
 
 # Binance Klines 컬럼 (공식 순서)
 COLS = [
-    "open_time", "open", "high", "low", "close", "volume",
-    "close_time", "quote_volume", "trades_count",
-    "taker_base", "taker_quote", "ignore",
+    "open_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "close_time",
+    "quote_volume",
+    "trades_count",
+    "taker_base",
+    "taker_quote",
+    "ignore",
 ]
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--years", type=int, default=3,
-                    help="다운로드할 연도 수 (기본: 3)")
+parser.add_argument("--years", type=int, default=3, help="다운로드할 연도 수 (기본: 3)")
 args = parser.parse_args()
 
 
 def _months_back(n_years: int) -> list[tuple[int, int]]:
     """현재 월 기준 n_years 전부터 지난달까지의 (year, month) 목록."""
-    now    = datetime.utcnow().replace(day=1)
-    start  = now - timedelta(days=365 * n_years)
+    now = datetime.utcnow().replace(day=1)
+    start = now - timedelta(days=365 * n_years)
     result = []
-    cur    = start.replace(day=1)
-    end    = (now - timedelta(days=1)).replace(day=1)
+    cur = start.replace(day=1)
+    end = (now - timedelta(days=1)).replace(day=1)
     while cur <= end:
         result.append((cur.year, cur.month))
         if cur.month == 12:
@@ -66,7 +74,7 @@ def _months_back(n_years: int) -> list[tuple[int, int]]:
 
 
 def download_month(symbol: str, year: int, month: int) -> pd.DataFrame | None:
-    fn  = f"{symbol}-{INTERVAL}-{year:04d}-{month:02d}.zip"
+    fn = f"{symbol}-{INTERVAL}-{year:04d}-{month:02d}.zip"
     url = f"{BASE_URL}/{symbol}/{INTERVAL}/{fn}"
 
     for attempt in range(1, RETRY + 1):
@@ -90,8 +98,10 @@ def download_month(symbol: str, year: int, month: int) -> pd.DataFrame | None:
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 months = _months_back(args.years)
-print(f"다운로드 기간: {months[0][0]}-{months[0][1]:02d} ~ "
-      f"{months[-1][0]}-{months[-1][1]:02d}  ({len(months)}개월)")
+print(
+    f"다운로드 기간: {months[0][0]}-{months[0][1]:02d} ~ "
+    f"{months[-1][0]}-{months[-1][1]:02d}  ({len(months)}개월)"
+)
 
 for symbol in SYMBOLS:
     print(f"\n[{symbol}] 다운로드 시작...")
@@ -99,7 +109,7 @@ for symbol in SYMBOLS:
 
     for year, month in months:
         tag = f"{year}-{month:02d}"
-        df  = download_month(symbol, year, month)
+        df = download_month(symbol, year, month)
         if df is None:
             continue
         frames.append(df)
@@ -113,21 +123,26 @@ for symbol in SYMBOLS:
     merged = pd.concat(frames, ignore_index=True)
 
     # 정제
-    out = pd.DataFrame({
-        "timestamp":    merged["open_time"].astype("int64"),   # ms
-        "open":         merged["open"].astype(float),
-        "high":         merged["high"].astype(float),
-        "low":          merged["low"].astype(float),
-        "close":        merged["close"].astype(float),
-        "volume":       merged["volume"].astype(float),        # = volume_base
-        "trades_count": merged["trades_count"].astype(int),
-    })
-    out = out.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+    out = pd.DataFrame(
+        {
+            "timestamp": merged["open_time"].astype("int64"),  # ms
+            "open": merged["open"].astype(float),
+            "high": merged["high"].astype(float),
+            "low": merged["low"].astype(float),
+            "close": merged["close"].astype(float),
+            "volume": merged["volume"].astype(float),  # = volume_base
+            "trades_count": merged["trades_count"].astype(int),
+        }
+    )
+    out = (
+        out.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+    )
 
     path = OUT_DIR / f"{symbol}_{INTERVAL}.csv"
     out.to_csv(path, index=False)
-    start_dt = pd.to_datetime(out["timestamp"].iloc[0],  unit="ms")
-    end_dt   = pd.to_datetime(out["timestamp"].iloc[-1], unit="ms")
+    # 1000으로 나누어 명시적으로 초(s) 단위로 변경하여 Pandas의 내부 계산 오류를 차단합니다.
+    start_dt = pd.to_datetime(out["timestamp"].iloc[0] / 1000.0, unit="s")
+    end_dt = pd.to_datetime(out["timestamp"].iloc[-1] / 1000.0, unit="s")
     print(f"  저장: {path}  ({len(out):,}행, {start_dt:%Y-%m-%d} ~ {end_dt:%Y-%m-%d})")
 
 print("\n✅ 다운로드 완료!")
